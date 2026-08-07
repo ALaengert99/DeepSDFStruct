@@ -153,3 +153,7 @@ run_mlflow_reconstruction.py
 
 # development journal
 history.md
+
+# benchmark temp files
+benchmarks/topo_showcase/tmp
+benchmarks/topo_showcase/mbb_output

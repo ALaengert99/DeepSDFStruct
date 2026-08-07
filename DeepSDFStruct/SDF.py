@@ -1010,7 +1010,8 @@ class SDFfromMesh(SDFBase):
         self.mesh = mesh
 
     def _get_domain_bounds(self):
-        return self.mesh.bounds
+        # Change to torch array as per definition
+        return torch.from_numpy(self.mesh.bounds)
 
     def _compute(self, queries: torch.Tensor | np.ndarray):
         num_points = (
@@ -1444,7 +1445,7 @@ class TransformedSDF(SDFBase):
         return sdf_vals
 
     def _get_domain_bounds(self) -> torch.Tensor:
-        return self.sdf._get_domain_bounds()
+        return (self.sdf._get_domain_bounds() + self.translation) * self.scale   # TODO: check this new implementation
 
 
 class CappedBorderSDF(SDFBase):

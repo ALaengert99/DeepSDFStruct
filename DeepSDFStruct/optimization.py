@@ -44,6 +44,38 @@ import pyvista
 import logging
 import DeepSDFStruct
 
+from abc import ABC, abstractmethod
+from DeepSDFStruct.SDF import SDFfromDeepSDF, SDFfromMesh, DifferenceSDF, UnionSDF, NegatedCallable, TransformedSDF
+from DeepSDFStruct.local_shapes import LocalShapesSDF
+import trimesh
+import gustaf as gus
+from DeepSDFStruct.mesh import (
+    create_3D_mesh,
+    export_sdf_grid_vtk,
+    torchVolumeMesh,
+)
+from torchfem import Solid
+from torchfem.materials import IsotropicElasticity3D
+from types import SimpleNamespace
+import splinepy
+from DeepSDFStruct.parametrization import SplineParametrization
+from hashlib import sha256
+from pathlib import Path
+from DeepSDFStruct.sampling import sample_mesh_surface, random_sample_sdf
+from DeepSDFStruct.deep_sdf.reconstruction import reconstruct_from_samples
+import matplotlib.pyplot as plt
+import pyvista as pv
+from sklearn.decomposition import PCA
+from DeepSDFStruct.pretrained_models import PretrainedModels
+from DeepSDFStruct.deep_sdf.models import DeepSDFModel
+from DeepSDFStruct.geom_reconstruction import LocalShapesReconstructor
+from DeepSDFStruct.SDF import SDFBase
+
+
+
+
+
+
 logger = logging.getLogger(DeepSDFStruct.__name__)
 
 
@@ -643,3 +675,884 @@ class MMA:
             f"It.: {self.loop:4d} | J.: {F_np[0,0]:1.3e} | "
             f"G: {[float(g) for g in G_np[:, 0]]} | ch.: {self.ch:1.3e}"
         )
+
+
+
+
+class Region(ABC):
+    """
+       Abstraction class for geometric Regions to be used in Optimization problems.
+       As Input, DeepSDFs, SDFs, stl meshes or formulas can be used.
+       Uniform scaling is handled by this class.
+    """
+    def __init__(self):
+        super().__init__()
+        pass
+
+    @classmethod
+    def create(cls, geometry, threshold=None):
+        logger.info(f"Factory method for Region called with region type {type(geometry)}")
+        # if isinstance(geometry, LocalShapesSDF):
+        #     return LatticeRegion(geometry, optimize)
+        if isinstance(geometry, SDFBase):
+            return SDFRegion(geometry)   # Okay to use SDF base class?
+        elif isinstance(geometry, trimesh.Trimesh):
+            return MeshRegion(geometry, threshold)
+        elif isinstance(geometry, gus.Faces):
+            # Convenience wrapper
+            return MeshRegion(trimesh.Trimesh(geometry.vertices, geometry.faces), threshold)
+        else:
+            raise TypeError(f"Geometry of type {type(geometry)} not supported")
+
+    # @classmethod
+    # def create_parametrized(cls, region):
+    #     return region.parametrize()
+
+    def parametrize(self,
+            tiling: list[int] = [8, 8, 8],
+            save_dir: str = './'
+        ):
+        recon = LocalShapesReconstructor(output_dir=save_dir, device='cpu')
+        if self.mesh is None:
+            raise Exception("The given region doesn't expose a mesh")
+
+    
+        filename = f"{self._hash}.pt"
+        base_dir = Path(save_dir).resolve()
+        f = Path(base_dir / filename)
+        if f.is_file():   # TODO: check if other params like tiling & base_sdf are the same
+            built = recon.build_struct(self.mesh, tiling)
+            struct = built.struct
+            scaling = built.scaling
+            recon_param = torch.load(
+                str(f), weights_only=True, map_location='cpu'  # TODO: change cpu to parameter
+            )
+            struct.parametrization.load_state_dict(recon_param)
+            logger.warning("Using found reconstruction parameters")
+        else:
+            logger.info(f"fitting lattice to provided mesh..")
+            struct, scaling, _, _ = recon.fit_mesh(
+                mesh=self.mesh,
+                tiling=tiling
+            )
+            torch.save(
+                struct.parametrization.state_dict(),
+                str(f),
+            )
+            logger.info(f"Saved parameter dict to {str(f)}")
+    
+        export_sdf_grid_vtk(struct, save_dir / "fitted_latice.vtk")
+    
+    
+        lattice = ParametrizedLattice(
+            geometry=struct,
+            scaling=scaling,
+        )
+        
+        export_sdf_grid_vtk(lattice.sdf, save_dir / "scaled_latice.vtk")
+    
+        return lattice
+
+
+    @property
+    @abstractmethod
+    def sdf(self):
+        """
+            sdf that is scaled to the original physical space
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def mesh(self):
+        """
+            Trimesh
+        """
+
+    @property
+    @abstractmethod
+    def _hash(self):
+        """
+            Return a hash of the underlying region & geometry for caching purposes
+        """
+        pass
+
+    @abstractmethod
+    def contains(self, vertices: torch.Tensor):
+        """
+            Computes if the specified vertices lie inside the region.
+
+            Parameters
+            ----------
+            vertices : torch.Tensor
+                Vertex coordinates of shape (N, 3).
+            Returns
+            -------
+            torch.Tensor
+                Boolean array of shape (N, ). True for each vertice that lies inside the Region, False otherwise.
+
+        """
+        pass
+
+
+class ParametrizedRegion(ABC):
+    def __init__(self):
+        super().__init__()
+
+    @property
+    @abstractmethod
+    def sdf(self):
+        """
+            Return sdf that is scaled to the original physical space
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def parametrization(self):
+        """
+            Return the parametrization of this region to be uses in an optimization.
+        """
+        pass
+
+    # Is that needed?
+    # @abstractmethod
+    # def contains(self, vertices: torch.Tensor):
+    #     pass
+
+
+class ParametrizedLattice(ParametrizedRegion):
+    def __init__(self, geometry, scaling = None):
+        super().__init__()
+        self.lattice = geometry
+        self.scaling = scaling
+
+    @property
+    def parametrization(self):
+        return next(self.lattice.parametrization.parameters())
+
+    @property
+    def sdf(self):
+        if self.scaling is None:
+            return self.lattice
+        else:
+            return TransformedSDF(
+                sdf=self.lattice,
+                translation=self.scaling.translation / self.scaling.scale_factors,    # Potential bug in TransformedSDF? Need to scale the translation by the scale factor
+                scaleFactor=self.scaling.scale_factors
+            )
+
+
+class SDFRegion(Region):
+    def __init__(self, geometry):
+        super().__init__()
+        self._mesh = None
+        self._sdf = geometry
+
+    def contains(self, vertices):
+        return self.sdf(vertices) <= 0
+
+    @property
+    def sdf(self):
+        return self._sdf
+
+    @property
+    def mesh(self):
+        if self._mesh is None:
+            torch_mesh, _ = create_3D_mesh(
+                self.sdf,
+                64,  # TODO: Not hardcoded
+                mesh_type="surface",
+                differentiate=False,
+                device='cpu'   # TODO: Not hardcoded
+            )
+            self._mesh = torch_mesh.to_trimesh()
+        return self._mesh
+
+    @property
+    def _hash(self):
+        return sha256(self.mesh.vertices).hexdigest()   # Base hash on the mesh for now
+
+
+
+class MeshRegion(Region):
+    def __init__(self, geometry, threshold=None):
+        super().__init__()
+        self._mesh = geometry
+        self._sdf = None
+        self.threshold = threshold
+        logger.info(f"Instantiated {self.__class__}")
+
+    @property
+    def sdf(self):
+        if self._sdf is None:
+            self._sdf = SDFfromMesh(
+                self.mesh,
+                scale=False,
+                **({'threshold': self.threshold} if self.threshold else {})
+            )
+        return self._sdf
+
+    @property
+    def mesh(self):
+        return self._mesh
+
+    @property
+    def _hash(self):
+        return sha256(self.mesh.vertices).hexdigest()
+
+    def contains(self, vertices):
+        return np.squeeze(self.sdf(vertices) <= 0)   # TODO: Investigate accuracy offset
+
+
+# def parametrize_region(
+#         dead_region: Region,
+#         base_sdf: str | PretrainedModels | DeepSDFModel = PretrainedModels.Primitives,
+#         tiling: list[int] = [8, 8, 8],
+#         save_dir: str = './'
+#     ):
+#     recon = LocalShapesReconstructor(output_dir=save_dir, device='cpu')
+#     mesh = dead_region.mesh
+
+#     filename = f"{sha256(mesh.vertices).hexdigest()}.pt"
+#     base_dir = Path(save_dir).resolve()
+#     f = Path(base_dir / filename)
+#     if f.is_file():   # TODO: check if other params like tiling & base_sdf are the same
+#         built = recon.build_struct(mesh, tiling)
+#         struct = built.struct
+#         scaling = built.scaling
+#         recon_param = torch.load(
+#             str(f), weights_only=True, map_location='cpu'  # TODO: change cpu to parameter
+#         )
+#         struct.parametrization.load_state_dict(recon_param)
+#         logger.warning("Using found reconstruction parameters")
+#     else:
+#         struct, scaling, _, _ = recon.fit_mesh(
+#             mesh=mesh,
+#             tiling=tiling
+#         )
+#         torch.save(
+#             struct.parametrization.state_dict(),
+#             str(f),
+#         )
+#         logger.info(f"Saved parameter dict to {str(f)}")
+
+#     export_sdf_grid_vtk(struct, save_dir / "fitted_latice.vtk")
+
+
+#     lattice = LatticeRegion(
+#         geometry=struct,
+#         scaling=scaling,
+#         optimize=True
+#     )
+    
+#     export_sdf_grid_vtk(lattice.sdf, save_dir / "scaled_latice.vtk")
+
+#     return lattice
+
+# def parametrize_region(dead_region, base_sdf, tiles_count=16, pretrain=False, save_dir='./'):
+#     """
+#         Parametrize a dead region as a Lattice SDF
+#     """
+#     # TODO: Rename pretrain, make a geometry passable
+#     # TODO: fix mix between np & torch
+#     # Construct lattice SDF to be used for optimization:
+#     # device = "cuda" if torch.cuda.is_available() else "cpu"
+#     device = base_sdf.device
+
+#     bounds = dead_region.mesh.bounds
+#     extents = dead_region.mesh.extents
+#     rough_unit_size = extents.max() / tiles_count
+#     tiling = np.int64(extents // rough_unit_size)
+
+#     torch.set_default_dtype(torch.float64)  # TODO: Bad practice
+#     base_sdf._decoder.to(torch.float64)
+#     # torch.set_default_device(device)
+
+#     sdf = SDFfromDeepSDF(base_sdf)
+#     knot_vec = np.array(
+#         [
+#             [bounds[0, 0], bounds[0, 0], bounds[1, 0], bounds[1, 0]],
+#             [bounds[0, 1], bounds[0, 1], bounds[1, 1], bounds[1, 1]],
+#             [bounds[0, 2], bounds[0, 2], bounds[1, 2], bounds[1, 2]],
+#         ]
+#     ).round(2)
+#     cp = [[1.0] * base_sdf._trained_latent_vectors[13].shape[0]] * 8  # TODO: why 13?
+
+#     param_spline_sp = splinepy.BSpline([1, 1, 1], knot_vec, cp)
+
+#     for i_box, (n_box, kv) in enumerate(zip(tiling, knot_vec)):
+#         knots = np.linspace(kv[0], kv[-1], n_box + 1)[1:-1]
+#         print(f"Inserting {n_box-1} knots at {knots} into spline dim {i_box}")
+#         param_spline_sp.insert_knots(i_box, knots)
+#     # Define a spline-based deformation field
+
+#     param_spline = SplineParametrization(param_spline_sp, device=device)
+
+
+#     with torch.no_grad():
+#         for p in param_spline.parameters():
+#             torch.nn.init.xavier_uniform_(p)
+
+#     # Create the lattice structure with deformation and microtile
+#     lattice_struct = LocalShapesSDF(
+#         tiling=tiling.tolist(),
+#         unit_cell=sdf,
+#         parametrization=param_spline,
+#         bounds=torch.tensor(bounds, device=device),
+#     )
+
+#     if pretrain:
+#         # Hash the coordinates of the mesh vertices in order to identify previously used regions
+#         filename = f"{sha256(dead_region.mesh.vertices).hexdigest()}_{tiles_count}.pt"  # TODO: Add base_sde name
+#         base_dir = Path(save_dir).resolve()
+#         f = Path(base_dir / filename)
+
+#         if f.is_file():
+#             logger.info(f"Found file to load parameter dict: {str(f)}")
+#             recon_param = torch.load(
+#                 str(f), weights_only=True, map_location=device
+#             )
+#             lattice_struct.parametrization.load_state_dict(recon_param)
+#             logger.warning("Using found reconstruction parameters")
+#         else:
+#             logger.info(f"Prefitting parametrized lattice structure to specified domain")
+#             dtype = torch.get_default_dtype()
+#             uniform_samples = random_sample_sdf(
+#                 dead_region.sdf,
+#                 dead_region.mesh.bounds,
+#                 n_samples=int(5e4),
+#                 device=device,
+#                 dtype=dtype,
+#             )
+#             surface_samples = sample_mesh_surface(
+#                 dead_region.sdf,
+#                 dead_region.mesh,
+#                 n_samples=int(1e4),
+#                 stds=[0.0, 0.025],
+#                 device=device,
+#                 dtype=dtype,
+#             )
+
+#             SDF_samples = uniform_samples + surface_samples
+#             recon_param = reconstruct_from_samples(
+#                 lattice_struct,
+#                 SDF_samples,
+#                 lr=1e-4,
+#                 loss_fn="ClampedL1",
+#                 num_iterations=100,
+#                 batch_size=2**14,
+#                 deformation_function=None
+#             )
+#             torch.save(
+#                 lattice_struct.parametrization.state_dict(),
+#                 str(f),
+#             )
+#             logger.info(f"Saved parameter dict to {str(f)}")
+
+#     return Region.create(lattice_struct, optimize=True)
+
+
+class Condition(ABC):
+    """
+    Abstraction class for conditions for the FEM simulation.
+    Once instantiated, they must implement the method apply to apply the
+    BC on a given torchfem solid simulation
+    """
+    def __init__(self):
+        super().__init__()
+
+
+    @abstractmethod
+    def apply(self, model: torchfem.Solid):
+        pass
+
+
+class Force(Condition):
+    def __init__(self, region: Region, magnitude):
+        super().__init__()
+        self.region = region
+        self.magnitude = magnitude
+
+    def apply(self, model: torchfem.Solid):
+        mask = self.region.contains(model.nodes)
+        indices = torch.nonzero(mask, as_tuple=True)[0]
+        num_nodes = len(indices)
+        if num_nodes == 0:
+            # TODO: How do we want to handle this?
+            logger.warning("No nodes found to apply force")
+        else:
+            for i in range(len(self.magnitude)):
+                model.forces[indices, i] += self.magnitude[i] / num_nodes
+
+
+class Moment(Condition):
+    def __init__(self, region: Region, center: list, moment: list):
+        super().__init__()
+        self.region = region
+        self.center = torch.tensor(center, dtype=torch.float64)
+        self.moment = torch.tensor(moment, dtype=torch.float64)
+
+    def apply(self, model: torchfem.Solid):
+        mask = self.region.contains(model.nodes)
+        indices = torch.nonzero(mask, as_tuple=True)[0]
+        num_nodes = len(indices)
+        if num_nodes == 0:
+            # TODO: How do we want to handle this?
+            logger.warning("No nodes found to apply moment")
+        else:
+            r = model.nodes[mask] - self.center
+            c = torch.cross(self.moment[None, :], r, dim=1)
+            f = c / torch.square(torch.linalg.norm(r, dim=1))[:, None]
+            model.forces[indices] += f / num_nodes
+
+
+class SPC(Condition):
+    def __init__(self, region: Region, dofs):
+        super().__init__()
+        self.region = region
+        self.dofs = dofs
+
+    def apply(self, model):
+        mask = self.region.contains(model.nodes)
+        indices = torch.nonzero(mask, as_tuple=True)[0]
+        if len(indices) == 0:
+            # TODO: How do we want to handle this?
+            logger.warning("No nodes found to apply SPC")
+        else:
+            for dof in self.dofs:
+                model.constraints[indices, dof] = True
+
+
+class Displacement(Condition):
+    def __init__(self, region: Region, disp):
+        super().__init__()
+        self.region = region
+        self.disp = disp
+
+    def apply(self, model):
+        raise NotImplementedError("Displacement constraint not implemented yet")
+       
+
+
+class DesignResponse(ABC, torch.nn.Module):
+    """
+    Abstraction class for Design Responses. Can be used as Optimization Objectives or Constraints.
+    Calculates the Response based on the FEM simulation result 
+    """
+    def __init__(self):
+        super().__init__()
+        pass
+
+    @abstractmethod
+    def forward(self, fe_results: SimpleNamespace):
+        pass
+
+    def _filter_elements(self, nodes, elements, region):
+        if elements.shape[1] != 4:
+            raise ValueError("Only tets supported so far")
+
+        mask_nodes = region.contains(nodes)
+        mask_elements = mask_nodes[elements].all(dim=1)     # Filter elements so all nodes are inside the region
+        # mask_elements = mask[elements].any(dim=1)   # Alternative implementation where at least one node has to be inside
+        return mask_elements
+        
+
+        
+
+class VolumeResponse(DesignResponse, torch.nn.Module):
+    def __init__(self, region: Region | None = None):
+        super().__init__()
+        self.region = region
+
+    def forward(self, fe_results):
+        # TODO: The calculated volume is smaller than when calculated traditionally because some boundary elements get filtered out
+        if self.region is None:
+            relevant = fe_results.model.elements
+        else:
+            relevant = fe_results.model.elements[self._filter_elements(fe_results.model.nodes, fe_results.model.elements, self.region)]
+        
+        volume = tet_signed_vol(fe_results.model.nodes, relevant).sum()
+        logger.info(f"Volume Response current: {volume:.2f}")
+        # tmp = trimesh.Trimesh(fe_results.model.nodes, relevant)
+        # tmp.export("filtered_volume_response_mesh.stl", "stl")
+
+        # def hook(grad):
+        #     logger.info(f"Gradient is being computed for VolumeResponse: {grad}")
+        # current_volume.register_hook(hook)
+
+        return volume
+
+
+class ComplianceResponse(DesignResponse, torch.nn.Module):
+    def __init__(self, region: Region | None = None):
+        super().__init__()
+        self.region = region
+
+    def forward(self, fe_results):
+        if self.region is None:
+            mask = torch.full((fe_results.model.nodes.shape[0],), True)
+        else:
+            mask = self.region.contains(fe_results.model.nodes).reshape(-1)
+        compliance = torch.inner(fe_results.f[mask].ravel(), fe_results.u[mask].ravel())
+        logger.info(f"Compliance Response: {compliance:.2f}")
+
+        # def hook(grad):
+        #     logger.info(f"Gradient is being computed for ComplianceResponse: {grad}")
+        # compliance.register_hook(hook)
+
+        return compliance
+
+
+class MisesStressResponse(DesignResponse, torch.nn.Module):
+    def __init__(self, region: Region | None = None):
+        super().__init__()
+        self.region = region
+
+    def forward(self, fe_results):
+
+        # if self.region is None:
+        #     relevant = fe_results.model.elements
+        # else:
+        #     relevant = self._filter_elements(fe_results.model.nodes, fe_results.model.elements, self.region)
+        # TODO: validate, add filtering
+        cauchy = fe_results.s
+        I = torch.eye(3, device=fe_results.s.device, dtype=fe_results.s.dtype)
+        mean_stress = torch.diagonal(cauchy, dim1=1, dim2=2).sum(1)[:, None, None] / 3.
+        deviatoric_stress = cauchy - mean_stress * I
+        mises = torch.sqrt(1.5 * torch.sum(torch.square(deviatoric_stress), dim=(1, 2)))
+        # mises = torch.sqrt(0.5 * (
+        #     (cauchy[:, 0, 0] - cauchy[:, 1, 2]) ** 2
+        #     +(cauchy[:, 1, 1] - cauchy[:, 2, 2]) ** 2
+        #     +(cauchy[:, 2, 2] - cauchy[:, 0, 0]) ** 2
+        #     +6*(cauchy[:, 0, 1] ** 2 + cauchy[:, 0, 2] ** 2 + cauchy[:, 1, 2] ** 2)
+        # ))
+        logger.info(f"Stress response, maximum: {torch.max(mises)}")
+        return mises
+
+
+class DisplacementResponse(DesignResponse, torch.nn.Module):
+    # TODO: Add way to specify relevant displacement component
+    def __init__(self, region: Region | None = None):
+        super().__init__()
+        self.region = region
+
+    def forward(self, fe_results):
+        if self.region is None:
+            mask = torch.full((fe_results.model.nodes.shape[0],), True)
+        else:
+            mask = self.region.contains(fe_results.model.nodes).reshape(-1)
+        disp = torch.linalg.norm(fe_results.u[mask, :])
+        return disp
+        
+
+
+
+
+class Analysis():
+    """
+        Class to define an Analysis with the associated loads and boundary conditions
+    """
+    def __init__(self,
+            conditions: list[Condition] | Condition,
+            responses: list[DesignResponse] | DesignResponse,
+            func   # TODO: Better name
+        ):
+        self.conditions = conditions if isinstance(conditions, list) else [conditions]
+        self.responses = responses if isinstance(responses, list) else [responses]
+        self.func = func  # TODO: evaluate function
+
+
+class Topo():
+    """
+        Main class to run a topology optimization
+        TODO: de-spaghettify
+    """
+    def __init__(self,
+            design_domain: list[Region] | Region,
+            parametrized_domain: list[Region] | Region,
+            frozen_domain: list[Region] | Region,
+            analyses: list[Analysis] | Analysis
+        ):
+        self.design_domain = design_domain if isinstance(design_domain, list) else [design_domain]
+        self.parametrized_domain = parametrized_domain if isinstance(parametrized_domain, list) else [parametrized_domain]
+        self.frozen_domain = frozen_domain if isinstance(frozen_domain, list) else [frozen_domain]
+        self.analyses = analyses if isinstance(analyses, list) else [analyses]
+
+    def _geometry_creation(self):
+        if len(self.parametrized_domain) == 1:
+            parametrized_domain_complete = self.parametrized_domain[0].sdf
+        else:
+            parametrized_domain_complete = UnionSDF(*[g.sdf for g in self.parametrized_domain])
+
+        if len(self.design_domain) == 1:
+            design_domain_complete = self.design_domain[0].sdf
+        else:
+            design_domain_complete = UnionSDF(*[g.sdf for g in self.design_domain])
+
+        if len(self.frozen_domain) == 0:
+            frozen_domain_complete = None
+        elif len(self.frozen_domain) == 1:
+            frozen_domain_complete = self.frozen_domain[0].sdf
+        else:
+            frozen_domain_complete = UnionSDF(*[g.sdf for g in self.frozen_domain])
+
+        intersection = DifferenceSDF(
+            parametrized_domain_complete,
+            NegatedCallable(design_domain_complete)
+        )
+        if frozen_domain_complete is None:
+            return intersection
+        else:
+            return UnionSDF(intersection, frozen_domain_complete)
+
+    def _plot_graph(self, output_dir, history_objective, history_constraint, name):
+        fig, ax1 = plt.subplots()
+        ax1.set_xlabel("Iteration")
+        ax1.set_ylabel("Objective", color='tab:blue')
+        ax1.plot(range(1, len(history_objective) + 1), history_objective, color='tab:blue')
+        ax1.tick_params(axis='y', labelcolor='tab:blue')
+        ax1.set_yscale('log')
+
+        ax2 = ax1.twinx()
+        ax2.set_ylabel("Constraint", color='tab:red')
+        ax2.plot(range(1, len(history_constraint) + 1), history_constraint, color='tab:red')
+        ax2.tick_params(axis='y', labelcolor='tab:red')
+
+
+        fig.tight_layout()
+        plt.savefig(output_dir / (name + ".png"))
+        plt.close(fig)
+
+    def _plot_pca(self, output_dir, history_params, dF, dG):
+        if len(history_params) < 3:
+            return
+
+        dF = dF / np.linalg.norm(dF)
+        dG = dG / np.linalg.norm(dG)
+
+        pca = PCA(n_components=2)
+        X = np.stack(history_params)
+        Y = pca.fit_transform(X)
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        plt.plot(Y[:, 0], Y[:, 1], c='gray')
+        plt.scatter(Y[:-1, 0], Y[:-1, 1], c='gray', marker="o", linewidths=1.5)
+        plt.scatter(Y[-1, 0], Y[-1, 1], c='purple', marker="*", linewidths=4)
+
+        origin = Y[-1]
+        # dF:
+        dF2d = pca.transform((history_params[-1] + dF)[None])[0]
+        ax.annotate(
+            "",
+            xytext=origin,
+            xy=dF2d,
+            arrowprops=dict(arrowstyle='->', color='blue')
+        )
+
+        # dG:
+        dG2d = pca.transform((history_params[-1] + dG)[None])[0]
+        ax.annotate(
+            "",
+            xytext=origin,
+            xy=dG2d,
+            arrowprops=dict(arrowstyle='->', color='red')
+        )
+        
+        plt.savefig(output_dir / "PCA.png")
+        plt.close(fig)
+
+        return False
+
+    def _plot_mesh(self, output_dir, mesh, title):
+        plotter = pv.Plotter(off_screen=True)
+        plotter.add_mesh(
+            mesh,
+            scalars=mesh.cell_data['mises'],
+            show_edges=True,
+            edge_opacity=0.5,
+            clim=[0, np.percentile(mesh.cell_data['mises'], 99)],  # Limit to 99% percentile since there usually are some outliers
+            cmap='turbo',
+            scalar_bar_args={
+                'title': "Von Mises Stress",
+            },
+        )
+        plotter.screenshot(str(output_dir / title) + "_mises.png")
+        plotter.close()
+        del plotter
+
+        # Instantiate new plotter instead of reusing it, since some states get carried over otherwise
+        plotter = pv.Plotter(off_screen=True)
+        plotter.add_mesh(
+            mesh,
+            scalars=np.linalg.norm(
+                mesh.point_data["displacement"],
+                axis=1
+            ),
+            show_edges=True,
+            edge_opacity=0.5,
+            cmap='turbo',
+            scalar_bar_args={
+                "title": "Displacement",
+            },
+        )
+        plotter.screenshot(str(output_dir / title) + "_displacement.png")
+        plotter.close()
+        del plotter
+
+    def _get_pyvista_mesh(self, fe_results):
+        mesh = get_mesh_from_torchfem(fe_results.model)
+
+        mesh.point_data["displacement"] = fe_results.u.detach().cpu().numpy()
+
+        mises = MisesStressResponse().forward(fe_results).detach().cpu().numpy()  # Uses StressResponse to calculate mises stress
+        mesh.cell_data["mises"] = mises
+
+        mesh.cell_data["stress"] = fe_results.s.detach().cpu().numpy()
+
+        return mesh
+
+
+    def run(self,
+            output_dir='./',
+            plot_graph=False,
+            override_graph=True,
+            plot_mesh=False,
+            override_mesh_plot=True,
+            export_mesh=False,
+            override_mesh_export=True
+        ):
+        # TODO: support multiple desing domains, right now quick & dirty for only one
+        params = self.parametrized_domain[0].parametrization
+        for _, region in enumerate(self.parametrized_domain[1:]):
+            if region.parametrization is not None:
+                torch.stack([params, region.parametrization])  # TODO: research if legal
+
+        if params is None:
+            raise ValueError("No region with parametrization given")
+        param_bounds = np.zeros(params.reshape(-1, 1).shape) + np.array([-1.0, 1.0])
+        optimizer = MMA(params.reshape(-1, 1), param_bounds, max_step=0.01)    # TODO: make parameter for max step
+
+        history_objective = []
+        history_constraint = []
+        history_params = []
+
+        for i in range(1, 801):
+            logger.info(
+                f"Starting iteration with parameters: "
+                f"shape={tuple(params.shape)}, mean={params.mean().item():.4f}, std={params.std().item():.4f}"
+            )
+    
+            # Show first 10 values (flattened)
+            logger.debug(
+                f"First 10 parameter values: {[round(x, 4) for x in params.flatten()[:10].tolist()]}"
+            )
+
+            torch.set_default_dtype(torch.float32)
+            geom = self._geometry_creation()
+
+            export_sdf_grid_vtk(geom, str(output_dir / "current_complete_sdf.vtk"))
+
+            mesh, _ = create_3D_mesh(
+                geom,
+                64,  # TODO: Not hardcoded
+                mesh_type="volume",
+                differentiate=False,
+                device='cpu'   # TODO: as optional parameter
+            )
+            # mesh.remove_disconnected_regions(clear_unused=True)
+
+            gus.io.meshio.export(str( output_dir / "current_complete_mesh.vtk"), mesh.to_gus())
+
+            torch.set_default_dtype(torch.float64)
+            verts = mesh.vertices.double()   # Convert to double for torchfem pardiso solver
+            tets = mesh.volumes
+            # Material model (Ti-6Al-4V) in imperial units
+            material = IsotropicElasticity3D(E=210000.0, nu=0.342)
+            model = Solid(verts, tets, material)
+            # model.forces = model.forces.double()
+            # model.displacements = model.displacements.double()
+
+            objectives = []
+            constraints = []
+            for j, analysis in enumerate(self.analyses):
+                # Reset BC / Loads:
+                model.constraints[:] = False
+                model.forces[:] = 0.
+                model.displacements[:] = 0.
+
+                # Apply new BC / Loads:
+                for condition in analysis.conditions:
+                    condition.apply(model)
+
+                logger.info(f"Solving FE simulation..")
+                # TODO: Sometimes after many optimization steps, this breaks because of "Matrix A is singular because it contains empty rows" -> disconnected load introduction?
+                u, f, s, F, a = model.solve(rtol=0.001, device="cpu", method="pardiso", verbose=True)
+                fe_results = SimpleNamespace(u=u, f=f, s=s, F=F, a=a, model=model)
+
+                responses = []
+                for response in analysis.responses:
+                    responses.append(response.forward(fe_results))  # Evaluate Design Responses
+                objective, constraint = analysis.func(responses)    # Calculate objective & constraint
+                if objective is not None: objectives.append(objective)
+                if constraint is not None: constraints.append(constraint)
+
+
+                if plot_mesh or export_mesh:
+                    mesh = self._get_pyvista_mesh(fe_results)
+                    if plot_mesh:
+                        name = f"current_mesh_analysis_{j}"
+                        if not override_mesh_plot:
+                            name += f"_iteration_{i:03}"
+                        self._plot_mesh(output_dir, mesh, name)
+                    if export_mesh:
+                        name = f"current_mesh_analysis_{j}"
+                        if not override_mesh_export:
+                            name += f"_iteration_{(i):03}"
+                        mesh.save(str(output_dir / name) + ".vtk")
+                
+
+            logger.info(f"objectives: {objectives}")
+            logger.info(f"constraints: {constraints}")
+
+            if not objectives:
+                raise ValueError("No objective given")
+            if not constraints:
+                raise ValueError("No constraints given")
+
+            # For now, simply sum over all objectives / constraints
+            F = torch.stack(objectives).sum()
+            G = torch.stack(constraints).sum()
+            dF = torch.autograd.grad(F, params, retain_graph=True)[0]
+            dG = torch.autograd.grad(G, params, retain_graph=True)[0]
+            optimizer.step(F, dF, G, dG)
+
+
+            logger.info(f"========STEP INFO========")
+            logger.info(f"dF norm: {torch.norm(dF)}, variance: {torch.var(dF)}")
+            logger.info(f"dG norm: {torch.norm(dG)}, variance: {torch.var(dG)}")
+            logger.info(f"objective & constraint consistency: {torch.dot(dF.reshape(-1), dG.reshape(-1)) / (torch.norm(dF) * torch.norm(dG))}")
+
+
+            history_params.append(params.reshape(-1).detach().cpu().numpy())
+            # self._plot_pca(output_dir, history_params, dF.reshape(-1).detach().cpu().numpy(), dG.reshape(-1).detach().cpu().numpy())
+
+
+            # with torch.no_grad():
+            #     params -= 1e-6 * dF
+
+
+            # graph = torchviz.make_dot(dF, params={'params': params})
+            # graph.render("dF_graph", format='png')
+
+            history_objective.append(float(F.detach().cpu()))
+            history_constraint.append(float(G.detach().cpu()))
+
+            if plot_graph:
+                name = f"optimization_history"
+                if not override_graph:
+                    name += f"_iteration_{(i):03}"
+                self._plot_graph(output_dir, history_objective, history_constraint, name)
+
+            
+            logger.info(f"iteration {i} finished. Objective: {F}, gradient norm: {dF.norm()}, Constraint: {G}, gradient norm: {dG.norm()}")

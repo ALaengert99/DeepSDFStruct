@@ -1048,7 +1048,7 @@ def export_sdf_grid_vtk(sdf: SDFBase, filename, N=64, bounds=None):
 
     # Evaluate SDF
     with _torch.no_grad():
-        sdf_vals = sdf(_torch.tensor(points, device=sdf.get_device()))
+        sdf_vals = sdf(_torch.tensor(points.astype(np.float32), device=sdf.get_device()))   # Convert query points to float32
     sdf_vals = sdf_vals.detach().cpu().numpy().reshape(-1)
 
     # Create vtkPoints
