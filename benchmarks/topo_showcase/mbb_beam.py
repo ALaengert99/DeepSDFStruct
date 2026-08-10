@@ -1,13 +1,12 @@
 import sys
 from pathlib import Path
-import gustaf as gus
 import trimesh
 import numpy as np
 import torch
 
 
 # Add parent directory to import DeepSDFStruct
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from DeepSDFStruct.optimization import Region, SPC, Force, Moment, Analysis, VolumeResponse, ComplianceResponse, Topo, MisesStressResponse, DisplacementResponse
 from DeepSDFStruct.sdf_primitives import BoxSDF
@@ -22,7 +21,7 @@ tmp_dir = base_dir / 'mbb_output'
 
 beam = Region.create(BoxSDF(
         center=[30., 10., 0.],
-        extents=[60., 20., 10.]
+        extents=[60., 20., 2.]
 ))
 parametrized = beam.parametrize(
     tiling=[6, 2, 1],
@@ -30,16 +29,20 @@ parametrized = beam.parametrize(
 )
 
 roller_region = Region.create(BoxSDF(
-    center=[60. - 5. / 2, 0., 0.],
-    extents=[5., 2., 10.]
+    center=[60. - 5. / 2, 2. / 2., 0.],
+    extents=[5., 2., 2.]
 ))
 symmetry_region = Region.create(BoxSDF(
-    center=[0., 10., 0.],
-    extents=[2., 20., 10.]
+    center=[1., 10., 0.],
+    extents=[2., 20., 2.]
 ))
 load_region = Region.create(BoxSDF(
-    center=[0. + 3. / 2, 18., 0.],
-    extents=[3., 2., 10.]
+    center=[0. + 3. / 2, 20. - 2 / 2., 0.],
+    extents=[3., 2., 2.]
+))
+helper_frozen = Region.create(BoxSDF(
+    center=[0. + 3. / 2, 0. + 2 / 2., 0.],
+    extents=[3., 2., 2.]
 ))
 
 bc_roller = SPC(roller_region, [1, 2])
@@ -48,12 +51,21 @@ load = Force(load_region, [0., -30000., 0.])
 
 vol0 = beam.mesh.volume
 
-analysis = Analysis([bc_roller, bc_symmetry, load], [DisplacementResponse(load_region), VolumeResponse()], lambda res: (res[0].sum(), res[1] / (vol0 * 0.3) - 1))
+analysis = Analysis(
+    [bc_roller, bc_symmetry, load],
+    [ComplianceResponse(), VolumeResponse()],
+    lambda res, i: (res[0], res[1] / (vol0 - vol0 * max(0, min(0.85, i / 50))) - 1))
+
+# analysis = Analysis(
+#     [bc_roller, bc_symmetry, load],
+#     [VolumeResponse(), DisplacementResponse(symmetry_region)],
+#     lambda res, i: (res[0], torch.mean(res[1]) / (3.) - 1))
+
 
 optimization = Topo(
     design_domain=beam,
     parametrized_domain=parametrized,
-    frozen_domain=[load_region],
+    frozen_domain=[load_region, roller_region, helper_frozen],
     analyses=analysis
 )
 optimization.run(

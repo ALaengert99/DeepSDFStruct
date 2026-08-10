@@ -692,8 +692,6 @@ class Region(ABC):
     @classmethod
     def create(cls, geometry, threshold=None):
         logger.info(f"Factory method for Region called with region type {type(geometry)}")
-        # if isinstance(geometry, LocalShapesSDF):
-        #     return LatticeRegion(geometry, optimize)
         if isinstance(geometry, SDFBase):
             return SDFRegion(geometry)   # Okay to use SDF base class?
         elif isinstance(geometry, trimesh.Trimesh):
@@ -701,27 +699,44 @@ class Region(ABC):
         elif isinstance(geometry, gus.Faces):
             # Convenience wrapper
             return MeshRegion(trimesh.Trimesh(geometry.vertices, geometry.faces), threshold)
+        elif isinstance(geometry, callable):
+            return CallableRegion(geometry)
         else:
             raise TypeError(f"Geometry of type {type(geometry)} not supported")
 
-    # @classmethod
-    # def create_parametrized(cls, region):
-    #     return region.parametrize()
-
+    @classmethod
+    def create_parametrized(cls,
+            geometry,
+            tiling: list[int] = [8, 8, 8],
+            save_dir: str = './'
+        ):
+        """
+            Convenience wrapper for directly creating a parametrized region
+        """
+        region = cls.create(geometry)
+        return region.parametrize(tiling, save_dir)
+        
     def parametrize(self,
             tiling: list[int] = [8, 8, 8],
             save_dir: str = './'
         ):
-        recon = LocalShapesReconstructor(output_dir=save_dir, device='cpu')
+        if isinstance(self, CallableRegion):
+            raise Exception("A Formula Region can't be parametrized")
+
         if self.mesh is None:
             raise Exception("The given region doesn't expose a mesh")
 
+        recon = LocalShapesReconstructor(output_dir=save_dir, device='cpu')
     
         filename = f"{self._hash}.pt"
         base_dir = Path(save_dir).resolve()
         f = Path(base_dir / filename)
         if f.is_file():   # TODO: check if other params like tiling & base_sdf are the same
-            built = recon.build_struct(self.mesh, tiling)
+            built = recon.build_struct(
+                self.mesh,
+                tiling,
+                spline_degree=(1, 1, 0)
+            )
             struct = built.struct
             scaling = built.scaling
             recon_param = torch.load(
@@ -733,7 +748,8 @@ class Region(ABC):
             logger.info(f"fitting lattice to provided mesh..")
             struct, scaling, _, _ = recon.fit_mesh(
                 mesh=self.mesh,
-                tiling=tiling
+                tiling=tiling,
+                spline_degree=(1, 1, 0)
             )
             torch.save(
                 struct.parametrization.state_dict(),
@@ -794,53 +810,6 @@ class Region(ABC):
         """
         pass
 
-
-class ParametrizedRegion(ABC):
-    def __init__(self):
-        super().__init__()
-
-    @property
-    @abstractmethod
-    def sdf(self):
-        """
-            Return sdf that is scaled to the original physical space
-        """
-        pass
-
-    @property
-    @abstractmethod
-    def parametrization(self):
-        """
-            Return the parametrization of this region to be uses in an optimization.
-        """
-        pass
-
-    # Is that needed?
-    # @abstractmethod
-    # def contains(self, vertices: torch.Tensor):
-    #     pass
-
-
-class ParametrizedLattice(ParametrizedRegion):
-    def __init__(self, geometry, scaling = None):
-        super().__init__()
-        self.lattice = geometry
-        self.scaling = scaling
-
-    @property
-    def parametrization(self):
-        return next(self.lattice.parametrization.parameters())
-
-    @property
-    def sdf(self):
-        if self.scaling is None:
-            return self.lattice
-        else:
-            return TransformedSDF(
-                sdf=self.lattice,
-                translation=self.scaling.translation / self.scaling.scale_factors,    # Potential bug in TransformedSDF? Need to scale the translation by the scale factor
-                scaleFactor=self.scaling.scale_factors
-            )
 
 
 class SDFRegion(Region):
@@ -905,152 +874,73 @@ class MeshRegion(Region):
         return np.squeeze(self.sdf(vertices) <= 0)   # TODO: Investigate accuracy offset
 
 
-# def parametrize_region(
-#         dead_region: Region,
-#         base_sdf: str | PretrainedModels | DeepSDFModel = PretrainedModels.Primitives,
-#         tiling: list[int] = [8, 8, 8],
-#         save_dir: str = './'
-#     ):
-#     recon = LocalShapesReconstructor(output_dir=save_dir, device='cpu')
-#     mesh = dead_region.mesh
+class CallableRegion(Region):
+    def __init__(self, func: callable):
+        super().__init__()
+        self.func = func
 
-#     filename = f"{sha256(mesh.vertices).hexdigest()}.pt"
-#     base_dir = Path(save_dir).resolve()
-#     f = Path(base_dir / filename)
-#     if f.is_file():   # TODO: check if other params like tiling & base_sdf are the same
-#         built = recon.build_struct(mesh, tiling)
-#         struct = built.struct
-#         scaling = built.scaling
-#         recon_param = torch.load(
-#             str(f), weights_only=True, map_location='cpu'  # TODO: change cpu to parameter
-#         )
-#         struct.parametrization.load_state_dict(recon_param)
-#         logger.warning("Using found reconstruction parameters")
-#     else:
-#         struct, scaling, _, _ = recon.fit_mesh(
-#             mesh=mesh,
-#             tiling=tiling
-#         )
-#         torch.save(
-#             struct.parametrization.state_dict(),
-#             str(f),
-#         )
-#         logger.info(f"Saved parameter dict to {str(f)}")
+    @property
+    def sdf(self):
+        raise Exception(f"The sdf representation of a Formula Region was requested")
 
-#     export_sdf_grid_vtk(struct, save_dir / "fitted_latice.vtk")
+    @property
+    def mesh(self):
+        raise Exception(f"The mesh representation of a Formula Region was requested")
+
+    def contains(self, vertices):
+        return self.func(vertices)
+
+    @property
+    def _hash(self):
+        return sha256(self.func).hexdigest()
 
 
-#     lattice = LatticeRegion(
-#         geometry=struct,
-#         scaling=scaling,
-#         optimize=True
-#     )
-    
-#     export_sdf_grid_vtk(lattice.sdf, save_dir / "scaled_latice.vtk")
+class ParametrizedRegion(ABC):
+    def __init__(self):
+        super().__init__()
 
-#     return lattice
+    @property
+    @abstractmethod
+    def sdf(self):
+        """
+            Return sdf that is scaled to the original physical space
+        """
+        pass
 
-# def parametrize_region(dead_region, base_sdf, tiles_count=16, pretrain=False, save_dir='./'):
-#     """
-#         Parametrize a dead region as a Lattice SDF
-#     """
-#     # TODO: Rename pretrain, make a geometry passable
-#     # TODO: fix mix between np & torch
-#     # Construct lattice SDF to be used for optimization:
-#     # device = "cuda" if torch.cuda.is_available() else "cpu"
-#     device = base_sdf.device
+    @property
+    @abstractmethod
+    def parametrization(self):
+        """
+            Return the parametrization of this region to be uses in an optimization.
+        """
+        pass
 
-#     bounds = dead_region.mesh.bounds
-#     extents = dead_region.mesh.extents
-#     rough_unit_size = extents.max() / tiles_count
-#     tiling = np.int64(extents // rough_unit_size)
-
-#     torch.set_default_dtype(torch.float64)  # TODO: Bad practice
-#     base_sdf._decoder.to(torch.float64)
-#     # torch.set_default_device(device)
-
-#     sdf = SDFfromDeepSDF(base_sdf)
-#     knot_vec = np.array(
-#         [
-#             [bounds[0, 0], bounds[0, 0], bounds[1, 0], bounds[1, 0]],
-#             [bounds[0, 1], bounds[0, 1], bounds[1, 1], bounds[1, 1]],
-#             [bounds[0, 2], bounds[0, 2], bounds[1, 2], bounds[1, 2]],
-#         ]
-#     ).round(2)
-#     cp = [[1.0] * base_sdf._trained_latent_vectors[13].shape[0]] * 8  # TODO: why 13?
-
-#     param_spline_sp = splinepy.BSpline([1, 1, 1], knot_vec, cp)
-
-#     for i_box, (n_box, kv) in enumerate(zip(tiling, knot_vec)):
-#         knots = np.linspace(kv[0], kv[-1], n_box + 1)[1:-1]
-#         print(f"Inserting {n_box-1} knots at {knots} into spline dim {i_box}")
-#         param_spline_sp.insert_knots(i_box, knots)
-#     # Define a spline-based deformation field
-
-#     param_spline = SplineParametrization(param_spline_sp, device=device)
+    # TODO: Is that needed?
+    # @abstractmethod
+    # def contains(self, vertices: torch.Tensor):
+    #     pass
 
 
-#     with torch.no_grad():
-#         for p in param_spline.parameters():
-#             torch.nn.init.xavier_uniform_(p)
+class ParametrizedLattice(ParametrizedRegion):
+    def __init__(self, geometry, scaling = None):
+        super().__init__()
+        self.lattice = geometry
+        self.scaling = scaling
 
-#     # Create the lattice structure with deformation and microtile
-#     lattice_struct = LocalShapesSDF(
-#         tiling=tiling.tolist(),
-#         unit_cell=sdf,
-#         parametrization=param_spline,
-#         bounds=torch.tensor(bounds, device=device),
-#     )
+    @property
+    def parametrization(self):
+        return next(self.lattice.parametrization.parameters())
 
-#     if pretrain:
-#         # Hash the coordinates of the mesh vertices in order to identify previously used regions
-#         filename = f"{sha256(dead_region.mesh.vertices).hexdigest()}_{tiles_count}.pt"  # TODO: Add base_sde name
-#         base_dir = Path(save_dir).resolve()
-#         f = Path(base_dir / filename)
-
-#         if f.is_file():
-#             logger.info(f"Found file to load parameter dict: {str(f)}")
-#             recon_param = torch.load(
-#                 str(f), weights_only=True, map_location=device
-#             )
-#             lattice_struct.parametrization.load_state_dict(recon_param)
-#             logger.warning("Using found reconstruction parameters")
-#         else:
-#             logger.info(f"Prefitting parametrized lattice structure to specified domain")
-#             dtype = torch.get_default_dtype()
-#             uniform_samples = random_sample_sdf(
-#                 dead_region.sdf,
-#                 dead_region.mesh.bounds,
-#                 n_samples=int(5e4),
-#                 device=device,
-#                 dtype=dtype,
-#             )
-#             surface_samples = sample_mesh_surface(
-#                 dead_region.sdf,
-#                 dead_region.mesh,
-#                 n_samples=int(1e4),
-#                 stds=[0.0, 0.025],
-#                 device=device,
-#                 dtype=dtype,
-#             )
-
-#             SDF_samples = uniform_samples + surface_samples
-#             recon_param = reconstruct_from_samples(
-#                 lattice_struct,
-#                 SDF_samples,
-#                 lr=1e-4,
-#                 loss_fn="ClampedL1",
-#                 num_iterations=100,
-#                 batch_size=2**14,
-#                 deformation_function=None
-#             )
-#             torch.save(
-#                 lattice_struct.parametrization.state_dict(),
-#                 str(f),
-#             )
-#             logger.info(f"Saved parameter dict to {str(f)}")
-
-#     return Region.create(lattice_struct, optimize=True)
+    @property
+    def sdf(self):
+        if self.scaling is None:
+            return self.lattice
+        else:
+            return TransformedSDF(
+                sdf=self.lattice,
+                translation=self.scaling.translation / self.scaling.scale_factors,    # Potential bug in TransformedSDF? Need to scale the translation by the scale factor
+                scaleFactor=self.scaling.scale_factors
+            )
 
 
 class Condition(ABC):
@@ -1061,7 +951,6 @@ class Condition(ABC):
     """
     def __init__(self):
         super().__init__()
-
 
     @abstractmethod
     def apply(self, model: torchfem.Solid):
@@ -1138,7 +1027,7 @@ class Displacement(Condition):
 class DesignResponse(ABC, torch.nn.Module):
     """
     Abstraction class for Design Responses. Can be used as Optimization Objectives or Constraints.
-    Calculates the Response based on the FEM simulation result 
+    Calculates the Response based on the FEM simulation result
     """
     def __init__(self):
         super().__init__()
@@ -1146,15 +1035,33 @@ class DesignResponse(ABC, torch.nn.Module):
 
     @abstractmethod
     def forward(self, fe_results: SimpleNamespace):
+        """
+            Calculates the Design Response from the given SimulationResults
+        """
         pass
 
     def _filter_elements(self, nodes, elements, region):
-        if elements.shape[1] != 4:
-            raise ValueError("Only tets supported so far")
+        """
+            Return a boolean mask specifying for each element if the centroid (average nodal) position lies inside the specified region
 
-        mask_nodes = region.contains(nodes)
-        mask_elements = mask_nodes[elements].all(dim=1)     # Filter elements so all nodes are inside the region
+            Parameters
+            ----------
+            nodes : torch.Tensor
+                Vertex coordinates of shape (N, 3).
+            elements: torch.Tensor
+                Tensor of shape (N, o) specifying the node indices per element. For thetrahedral elements, o=4
+            region: Region
+                Region for which the contained elements should be filtered
+            Returns
+            -------
+            torch.Tensor
+                Boolean array of shape (N, ). True for each element which centroid lies inside the Region, False otherwise.
+        """
+        # mask_nodes = region.contains(nodes)
+        # mask_elements = mask_nodes[elements].all(dim=1)     # Filter elements so all nodes are inside the region
         # mask_elements = mask[elements].any(dim=1)   # Alternative implementation where at least one node has to be inside
+        centroids = torch.mean(nodes[elements], dim=1)  # Calculate the centroid position of each element by taking the average along each coordinate axis
+        mask_elements = region.contains(centroids)
         return mask_elements
         
 
@@ -1162,11 +1069,14 @@ class DesignResponse(ABC, torch.nn.Module):
 
 class VolumeResponse(DesignResponse, torch.nn.Module):
     def __init__(self, region: Region | None = None):
+        """
+            Calculates the volume of the mesh inside the specified region.
+            If no region is specified, the total volume is returned.
+        """
         super().__init__()
         self.region = region
 
     def forward(self, fe_results):
-        # TODO: The calculated volume is smaller than when calculated traditionally because some boundary elements get filtered out
         if self.region is None:
             relevant = fe_results.model.elements
         else:
@@ -1174,13 +1084,7 @@ class VolumeResponse(DesignResponse, torch.nn.Module):
         
         volume = tet_signed_vol(fe_results.model.nodes, relevant).sum()
         logger.info(f"Volume Response current: {volume:.2f}")
-        # tmp = trimesh.Trimesh(fe_results.model.nodes, relevant)
-        # tmp.export("filtered_volume_response_mesh.stl", "stl")
-
-        # def hook(grad):
-        #     logger.info(f"Gradient is being computed for VolumeResponse: {grad}")
-        # current_volume.register_hook(hook)
-
+        
         return volume
 
 
@@ -1431,7 +1335,7 @@ class Topo():
         if params is None:
             raise ValueError("No region with parametrization given")
         param_bounds = np.zeros(params.reshape(-1, 1).shape) + np.array([-1.0, 1.0])
-        optimizer = MMA(params.reshape(-1, 1), param_bounds, max_step=0.01)    # TODO: make parameter for max step
+        optimizer = MMA(params.reshape(-1, 1), param_bounds, max_step=0.005)    # TODO: make parameter for max step
 
         history_objective = []
         history_constraint = []
@@ -1467,11 +1371,9 @@ class Topo():
             torch.set_default_dtype(torch.float64)
             verts = mesh.vertices.double()   # Convert to double for torchfem pardiso solver
             tets = mesh.volumes
-            # Material model (Ti-6Al-4V) in imperial units
             material = IsotropicElasticity3D(E=210000.0, nu=0.342)
             model = Solid(verts, tets, material)
-            # model.forces = model.forces.double()
-            # model.displacements = model.displacements.double()
+
 
             objectives = []
             constraints = []
@@ -1493,7 +1395,7 @@ class Topo():
                 responses = []
                 for response in analysis.responses:
                     responses.append(response.forward(fe_results))  # Evaluate Design Responses
-                objective, constraint = analysis.func(responses)    # Calculate objective & constraint
+                objective, constraint = analysis.func(responses, i)    # Calculate objective & constraint
                 if objective is not None: objectives.append(objective)
                 if constraint is not None: constraints.append(constraint)
 
@@ -1536,14 +1438,6 @@ class Topo():
 
             history_params.append(params.reshape(-1).detach().cpu().numpy())
             # self._plot_pca(output_dir, history_params, dF.reshape(-1).detach().cpu().numpy(), dG.reshape(-1).detach().cpu().numpy())
-
-
-            # with torch.no_grad():
-            #     params -= 1e-6 * dF
-
-
-            # graph = torchviz.make_dot(dF, params={'params': params})
-            # graph.render("dF_graph", format='png')
 
             history_objective.append(float(F.detach().cpu()))
             history_constraint.append(float(G.detach().cpu()))
